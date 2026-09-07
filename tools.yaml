@@ -1,0 +1,728 @@
+sources:
+  retail_lens:
+    kind: bigquery
+    project: ${GOOGLE_CLOUD_PROJECT}
+
+toolsets:
+  sales_toolset:
+    - get_daily_sales_summary
+    - get_daily_product_movement
+    - get_sales_trends
+    - get_product_behavior_profile
+
+  inventory_toolset:
+    - get_product_inventory_profile
+    - get_inventory_category_profile
+    - get_product_profitability
+    - get_current_stock_levels
+    - get_current_supply_status
+    - get_replenishment_risk
+
+  workforce_toolset:
+    - get_workforce_summary
+
+  customer_toolset:
+    - get_customer_behavior_profile
+
+  # Note: get_replenishment_risk is added to inventory_toolset
+tools:
+  get_daily_sales_summary:
+    kind: bigquery-sql
+    source: retail_lens
+    description: "Get daily sales summary including sales_date, total_bills, transaction_lines, total_units_sold, total_revenue, average_bill_value"
+    statement: |
+      SELECT
+        DATE(time_stamp) AS sales_date,
+        COUNT(DISTINCT bill_number) AS total_bills,
+        COUNT(transaction_id) AS transaction_lines,
+        SUM(quantity) AS total_units_sold,
+        SUM(total_price) AS total_revenue,
+        SUM(total_price) / COUNT(DISTINCT bill_number) AS average_bill_value
+      FROM `retail_lens_patchamomma.sales_transactions`
+      GROUP BY 1
+      ORDER BY 1 DESC
+      LIMIT 1
+
+  # ---------------------------------------------------------------------------
+  # Milestone 2B — Sales Analytical Evidence Layer
+  #
+  # These three tools return DETERMINISTIC EVIDENCE only. They intentionally
+  # do NOT encode business classifications (e.g. STRONG_PERFORMER, GROWING,
+  # fast-moving, reorder, etc.) in SQL. Gemini reasons over the evidence later.
+  # ---------------------------------------------------------------------------
+
+  get_daily_product_movement:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Compare each product's sales on a target date against its recent
+      7-day completed baseline. Returns deterministic per-product evidence
+      (daily units/revenue vs. 7-day averages, selling frequency, etc.)
+      without any business classification. Pass target_date as YYYY-MM-DD.
+    parameters:
+      - name: target_date
+        type: string
+        description: The target date to evaluate, in YYYY-MM-DD format.
+    statement: |
+      WITH params AS (
+        SELECT DATE(@target_date) AS target_date
+      ),
+      baseline_window AS (
+        SELECT
+          DATE_SUB(p.target_date, INTERVAL idx DAY) AS d
+        FROM params p
+        CROSS JOIN UNNEST(GENERATE_ARRAY(1, 7)) AS idx
+      ),
+      -- Distinct products that have ever appeared in sales (for the grid).
+      product_universe AS (
+        SELECT DISTINCT product_id, product_name
+        FROM `retail_lens_patchamomma.sales_transactions`
+      ),
+      -- Product × date grid over the 7 completed baseline days so that
+      -- zero-sales days are explicitly represented.
+      baseline_grid AS (
+        SELECT
+          pu.product_id,
+          pu.product_name,
+          bw.d AS sales_date
+        FROM product_universe pu
+        CROSS JOIN baseline_window bw
+      ),
+      baseline_sales AS (
+        SELECT
+          DATE(s.time_stamp) AS sales_date,
+          s.product_id,
+          SUM(s.quantity) AS units,
+          COUNT(DISTINCT s.bill_number) AS bills,
+          SUM(s.total_price) AS revenue
+        FROM `retail_lens_patchamomma.sales_transactions` s
+        WHERE DATE(s.time_stamp) BETWEEN
+          DATE_SUB((SELECT target_date FROM params), INTERVAL 7 DAY)
+          AND DATE_SUB((SELECT target_date FROM params), INTERVAL 1 DAY)
+        GROUP BY 1, 2
+      ),
+      baseline_agg AS (
+        SELECT
+          bg.product_id,
+          bg.product_name,
+          AVG(COALESCE(bs.units, 0)) AS avg_7d_units,
+          AVG(COALESCE(bs.revenue, 0)) AS avg_7d_revenue,
+          SUM(COALESCE(bs.units, 0)) AS units_7d,
+          SUM(COALESCE(bs.revenue, 0)) AS revenue_7d,
+          COUNTIF(bs.units IS NOT NULL) AS selling_days_7d
+        FROM baseline_grid bg
+        LEFT JOIN baseline_sales bs
+          ON bs.sales_date = bg.sales_date
+          AND bs.product_id = bg.product_id
+        GROUP BY 1, 2
+      ),
+      target_sales AS (
+        SELECT
+          s.product_id,
+          SUM(s.quantity) AS daily_units,
+          COUNT(DISTINCT s.bill_number) AS daily_bills,
+          SUM(s.total_price) AS daily_revenue
+        FROM `retail_lens_patchamomma.sales_transactions` s
+        WHERE DATE(s.time_stamp) = (SELECT target_date FROM params)
+        GROUP BY 1
+      )
+      SELECT
+        t.product_id,
+        b.product_name,
+        i.category,
+        i.essentiality_tier,
+        COALESCE(ts.daily_units, 0) AS daily_units,
+        b.avg_7d_units,
+        CASE
+          WHEN b.avg_7d_units = 0 THEN NULL
+          ELSE ROUND(
+            (COALESCE(ts.daily_units, 0) - b.avg_7d_units) / b.avg_7d_units * 100,
+            2
+          )
+        END AS units_vs_7d_pct,
+        COALESCE(ts.daily_bills, 0) AS daily_bills,
+        COALESCE(ts.daily_revenue, 0) AS daily_revenue,
+        b.avg_7d_revenue,
+        CASE
+          WHEN b.avg_7d_revenue = 0 THEN NULL
+          ELSE ROUND(
+            (COALESCE(ts.daily_revenue, 0) - b.avg_7d_revenue) / b.avg_7d_revenue * 100,
+            2
+          )
+        END AS revenue_vs_7d_pct,
+        b.selling_days_7d,
+        ROUND(b.selling_days_7d / 7 * 100, 2) AS selling_frequency_pct,
+        b.units_7d,
+        b.revenue_7d
+      FROM target_sales t
+      LEFT JOIN baseline_agg b ON b.product_id = t.product_id
+      LEFT JOIN `retail_lens_patchamomma.inventory_metadata` i
+        ON i.prod_id = t.product_id
+      LEFT JOIN target_sales ts ON ts.product_id = t.product_id
+      ORDER BY COALESCE(ts.daily_units, 0) DESC
+
+  get_sales_trends:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Historical store-level daily sales trends over an arbitrary date range.
+      Returns sales_date, bills, units_sold and revenue only — no trend
+      classification. Pass start_date and end_date as YYYY-MM-DD.
+    parameters:
+      - name: start_date
+        type: string
+        description: Start of the date range, in YYYY-MM-DD format.
+      - name: end_date
+        type: string
+        description: End of the date range (inclusive), in YYYY-MM-DD format.
+    statement: |
+      SELECT
+        DATE(time_stamp) AS sales_date,
+        COUNT(DISTINCT bill_number) AS bills,
+        SUM(quantity) AS units_sold,
+        SUM(total_price) AS revenue
+      FROM `retail_lens_patchamomma.sales_transactions`
+      WHERE DATE(time_stamp) BETWEEN DATE(@start_date) AND DATE(@end_date)
+      GROUP BY 1
+      ORDER BY 1 ASC
+
+  get_product_behavior_profile:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Historical per-product behaviour profile over an arbitrary date range.
+      Joins sales_transactions to inventory_metadata and returns product
+      metadata, sales evidence, purchase-frequency evidence, monthly
+      units/revenue and period-over-period change evidence. No business
+      classification is applied. Pass start_date and end_date as YYYY-MM-DD.
+    parameters:
+      - name: start_date
+        type: string
+        description: Start of the date range, in YYYY-MM-DD format.
+      - name: end_date
+        type: string
+        description: End of the date range (inclusive), in YYYY-MM-DD format.
+    statement: |
+      WITH params AS (
+        SELECT DATE(@start_date) AS start_date, DATE(@end_date) AS end_date
+      ),
+      sales_in_range AS (
+        SELECT
+          s.product_id,
+          DATE(s.time_stamp) AS sales_date,
+          SUM(s.quantity) AS units,
+          SUM(s.total_price) AS revenue,
+          COUNT(DISTINCT s.bill_number) AS bills
+        FROM `retail_lens_patchamomma.sales_transactions` s
+        WHERE DATE(s.time_stamp) BETWEEN (SELECT start_date FROM params)
+          AND (SELECT end_date FROM params)
+        GROUP BY 1, 2
+      ),
+      product_daily AS (
+        SELECT
+          sir.product_id,
+          sir.sales_date,
+          sir.units,
+          sir.revenue,
+          sir.bills
+        FROM sales_in_range sir
+      ),
+      sales_summary AS (
+        SELECT
+          product_id,
+          COUNT(DISTINCT sales_date) AS active_sales_days,
+          SUM(units) AS total_units,
+          SUM(revenue) AS total_revenue,
+          SUM(bills) AS total_product_bills,
+          ROUND(SAFE_DIVIDE(SUM(units), COUNT(DISTINCT sales_date)), 2) AS avg_units_on_selling_day,
+          ROUND(SAFE_DIVIDE(SUM(bills), COUNT(DISTINCT sales_date)), 2) AS avg_bills_on_selling_day,
+          MIN(sales_date) AS first_sale_date,
+          MAX(sales_date) AS last_sale_date
+        FROM product_daily
+        GROUP BY 1
+      ),
+      -- Volatility = stddev of daily units across active selling days.
+      volatility AS (
+        SELECT
+          product_id,
+          ROUND(STDDEV_POP(units), 2) AS units_volatility
+        FROM product_daily
+        GROUP BY 1
+      ),
+      -- Purchase-frequency evidence from gaps between consecutive selling days.
+      sale_dates AS (
+        SELECT DISTINCT product_id, sales_date
+        FROM sales_in_range
+      ),
+      gaps AS (
+        SELECT
+          product_id,
+          DATE_DIFF(sales_date, LAG(sales_date) OVER (PARTITION BY product_id ORDER BY sales_date), DAY) AS gap_days
+        FROM sale_dates
+      ),
+      gap_stats AS (
+        SELECT
+          product_id,
+          ROUND(AVG(gap_days), 2) AS avg_days_between_sales,
+          ROUND(APPROX_QUANTILES(gap_days, 2)[OFFSET(1)], 2) AS median_days_between_sales,
+          MAX(gap_days) AS max_days_between_sales
+        FROM gaps
+        WHERE gap_days IS NOT NULL
+        GROUP BY 1
+      ),
+      monthly AS (
+        SELECT
+          product_id,
+          FORMAT_DATE('%Y-%m', sales_date) AS ym,
+          SUM(units) AS monthly_units,
+          SUM(revenue) AS monthly_revenue
+        FROM sales_in_range
+        GROUP BY 1, 2
+      ),
+      monthly_summary AS (
+        SELECT
+          product_id,
+          ARRAY_AGG(STRUCT(ym AS month, monthly_units, monthly_revenue) ORDER BY ym) AS monthly_data
+        FROM monthly
+        GROUP BY 1
+      ),
+      -- Period-over-period change: first month vs last month in range.
+      monthly_change AS (
+        SELECT
+          m1.product_id,
+          m1.monthly_units AS first_month_units,
+          m2.monthly_units AS last_month_units,
+          CASE
+            WHEN m1.monthly_units = 0 THEN NULL
+            ELSE ROUND((m2.monthly_units - m1.monthly_units) / m1.monthly_units * 100, 2)
+          END AS units_pct_change,
+          m1.monthly_revenue AS first_month_revenue,
+          m2.monthly_revenue AS last_month_revenue,
+          CASE
+            WHEN m1.monthly_revenue = 0 THEN NULL
+            ELSE ROUND((m2.monthly_revenue - m1.monthly_revenue) / m1.monthly_revenue * 100, 2)
+          END AS revenue_pct_change
+        FROM monthly m1
+        JOIN monthly m2
+          ON m1.product_id = m2.product_id
+        WHERE m1.ym = (SELECT MIN(ym) FROM monthly mm WHERE mm.product_id = m1.product_id)
+          AND m2.ym = (SELECT MAX(ym) FROM monthly mm WHERE mm.product_id = m1.product_id)
+      )
+      SELECT
+        i.prod_id AS product_id,
+        i.prod_name AS product_name,
+        i.category,
+        i.essentiality_tier,
+        i.perishability_class,
+        i.shelf_life_days,
+        i.storage_requirement,
+        i.cost,
+        i.retail,
+        ss.active_sales_days,
+        ss.total_units,
+        ss.total_revenue,
+        ss.total_product_bills,
+        ss.avg_units_on_selling_day,
+        ss.avg_bills_on_selling_day,
+        v.units_volatility,
+        ss.first_sale_date,
+        ss.last_sale_date,
+        gs.avg_days_between_sales,
+        gs.median_days_between_sales,
+        gs.max_days_between_sales,
+        ms.monthly_data AS monthly_units_and_revenue,
+        mc.first_month_units,
+        mc.last_month_units,
+        mc.units_pct_change,
+        mc.first_month_revenue,
+        mc.last_month_revenue,
+        mc.revenue_pct_change
+      FROM sales_summary ss
+      LEFT JOIN `retail_lens_patchamomma.inventory_metadata` i ON i.prod_id = ss.product_id
+      LEFT JOIN volatility v ON v.product_id = ss.product_id
+      LEFT JOIN gap_stats gs ON gs.product_id = ss.product_id
+      LEFT JOIN monthly_summary ms ON ms.product_id = ss.product_id
+      LEFT JOIN monthly_change mc ON mc.product_id = ss.product_id
+      ORDER BY ss.total_revenue DESC
+
+  # ---------------------------------------------------------------------------
+  # Milestone 4 - Inventory Agent Evidence Layer
+  #
+  # These tools return DETERMINISTIC inventory/product context only.
+  # They do NOT encode business classifications (e.g. OVERSTOCKED, REORDER,
+  # HIGH_RISK) in SQL. Gemini reasons over the evidence later.
+  # No stock-on-hand data is assumed or invented.
+  # ---------------------------------------------------------------------------
+
+  get_product_inventory_profile:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Return inventory/product characteristics for products from
+      inventory_metadata. Returns prod_id, prod_name, category, cost,
+      retail, essentiality_tier, perishability_class, shelf_life_days,
+      storage_requirement. Supports an optional product_name filter
+      for partial name matching. Does NOT include stock-on-hand data.
+    parameters:
+      - name: product_name
+        type: string
+        description: Optional partial product name to filter by (case-insensitive).
+    statement: |
+      SELECT
+        prod_id,
+        prod_name,
+        category,
+        cost,
+        retail,
+        essentiality_tier,
+        perishability_class,
+        shelf_life_days,
+        storage_requirement
+      FROM `retail_lens_patchamomma.inventory_metadata`
+      WHERE @product_name IS NULL OR @product_name = '' OR
+        LOWER(prod_name) LIKE CONCAT('%', LOWER(@product_name), '%')
+      ORDER BY category, prod_name
+
+  get_inventory_category_profile:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Return deterministic inventory characteristics summarized by category
+      from inventory_metadata. Returns category, product_count, average_cost,
+      average_retail, essentiality metrics, perishability metrics, and
+      average_shelf_life_days. Does NOT include stock-on-hand data or
+      business classifications.
+    statement: |
+      SELECT
+        category,
+        COUNT(*) AS product_count,
+        ROUND(AVG(cost), 2) AS average_cost,
+        ROUND(AVG(retail), 2) AS average_retail,
+        ROUND(AVG(essentiality_tier), 2) AS avg_essentiality_tier,
+        MAX(essentiality_tier) AS max_essentiality_tier,
+        MIN(essentiality_tier) AS min_essentiality_tier,
+        COUNTIF(perishability_class = 'PERISHABLE') AS perishable_count,
+        COUNTIF(perishability_class = 'NON_PERISHABLE') AS non_perishable_count,
+        ROUND(AVG(shelf_life_days), 2) AS average_shelf_life_days
+      FROM `retail_lens_patchamomma.inventory_metadata`
+      GROUP BY category
+      ORDER BY product_count DESC
+
+  # ---------------------------------------------------------------------------
+  # Milestone 6 - Profitability Evidence & Stock Levels
+  # ---------------------------------------------------------------------------
+
+  get_product_profitability:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Product-level profitability evidence over an arbitrary date range.
+      Joins sales_transactions to inventory_metadata to calculate revenue,
+      COGS, gross profit and gross margin. Does NOT claim net profit.
+      Pass start_date and end_date as YYYY-MM-DD.
+    parameters:
+      - name: start_date
+        type: string
+        description: Start of the date range, in YYYY-MM-DD format.
+      - name: end_date
+        type: string
+        description: End of the date range (inclusive), in YYYY-MM-DD format.
+    statement: |
+      SELECT
+        s.product_id,
+        ANY_VALUE(s.product_name) AS product_name,
+        ANY_VALUE(i.category) AS category,
+        SUM(s.quantity) AS units_sold,
+        SUM(s.total_price) AS revenue,
+        ROUND(SUM(s.quantity * i.cost), 2) AS cost_of_goods_sold,
+        ROUND(SUM(s.total_price) - SUM(s.quantity * i.cost), 2) AS gross_profit,
+        ROUND(
+          SAFE_DIVIDE(
+            SUM(s.total_price) - SUM(s.quantity * i.cost),
+            SUM(s.total_price)
+          ) * 100, 2
+        ) AS gross_margin_pct
+      FROM `retail_lens_patchamomma.sales_transactions` s
+      JOIN `retail_lens_patchamomma.inventory_metadata` i
+        ON i.prod_id = s.product_id
+      WHERE DATE(s.time_stamp) BETWEEN DATE(@start_date) AND DATE(@end_date)
+      GROUP BY s.product_id
+      ORDER BY gross_profit DESC
+
+  get_current_stock_levels:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Return current stock levels from inventory_stock joined to
+      inventory_metadata. Returns product_id, product_name, category,
+      stock_on_hand, reorder_level, last_updated. If stock data is not
+      populated, returns empty results. Does NOT fabricate stock values.
+    statement: |
+      SELECT
+        st.product_id,
+        i.prod_name AS product_name,
+        i.category,
+        st.stock_on_hand,
+        st.reorder_level,
+        st.last_updated
+      FROM `retail_lens_patchamomma.inventory_stock` st
+      LEFT JOIN `retail_lens_patchamomma.inventory_metadata` i
+        ON i.prod_id = st.product_id
+      ORDER BY i.category, i.prod_name
+
+  get_current_supply_status:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Return current supply status from inventory_supply joined to
+      inventory_metadata. Returns product_id, product_name, category,
+      supplier_id, supplier_lead_time_days, incoming_quantity,
+      expected_delivery_date, last_updated. Shows pending deliveries
+      and supplier information. Does NOT fabricate supply data.
+    statement: |
+      SELECT
+        sup.product_id,
+        i.prod_name AS product_name,
+        i.category,
+        sup.supplier_id,
+        sup.supplier_lead_time_days,
+        sup.incoming_quantity,
+        sup.expected_delivery_date,
+        sup.last_updated
+      FROM `retail_lens_patchamomma.inventory_supply` sup
+      LEFT JOIN `retail_lens_patchamomma.inventory_metadata` i
+        ON i.prod_id = sup.product_id
+      ORDER BY i.category, i.prod_name
+
+  # ---------------------------------------------------------------------------
+  # Milestone 8 - Workforce Analytical Evidence
+  # ---------------------------------------------------------------------------
+
+  get_workforce_summary:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Employee-level workforce summary over a date range. Returns
+      employee_name, shifts_worked, scheduled_hours, actual_hours,
+      total_wages_inr, average_hours_per_shift, check_in_count,
+      late_check_in_count, early_departure_count, overtime_shift_count.
+      Actual hours derived from check_in/check_out timestamps.
+      Late/early/overtime based on scheduled times in shift_timing.
+      Pass start_date and end_date as YYYY-MM-DD.
+    parameters:
+      - name: start_date
+        type: string
+        description: Start of the date range, in YYYY-MM-DD format.
+      - name: end_date
+        type: string
+        description: End of the date range (inclusive), in YYYY-MM-DD format.
+    statement: |
+      WITH shift_parsed AS (
+        SELECT
+          shift_id,
+          shift_date,
+          employee_name,
+          hours_worked,
+          hourly_wage_inr,
+          shift_timing,
+          check_in_timestamp,
+          check_out_timestamp,
+          -- Parse scheduled start/end from shift_timing string
+          -- Morning Shift (9AM - 5PM) -> 09:00 / 17:00
+          -- Evening Peak (5PM - 10PM) -> 17:00 / 22:00
+          CASE
+            WHEN shift_timing LIKE 'Morning%' THEN TIME(9, 0, 0)
+            WHEN shift_timing LIKE 'Evening%' THEN TIME(17, 0, 0)
+            ELSE TIME(9, 0, 0)
+          END AS scheduled_start_time,
+          CASE
+            WHEN shift_timing LIKE 'Morning%' THEN TIME(17, 0, 0)
+            WHEN shift_timing LIKE 'Evening%' THEN TIME(22, 0, 0)
+            ELSE TIME(17, 0, 0)
+          END AS scheduled_end_time,
+          -- Actual hours from timestamps
+          CASE
+            WHEN check_in_timestamp IS NOT NULL AND check_out_timestamp IS NOT NULL
+            THEN ROUND(DATETIME_DIFF(check_out_timestamp, check_in_timestamp, MINUTE) / 60.0, 2)
+            ELSE NULL
+          END AS actual_hours,
+          -- Scheduled duration in hours
+          CASE
+            WHEN shift_timing LIKE 'Morning%' THEN 8.0
+            WHEN shift_timing LIKE 'Evening%' THEN 5.0
+            ELSE CAST(hours_worked AS FLOAT64)
+          END AS scheduled_duration_hours
+        FROM `retail_lens_patchamomma.workforce_shifts`
+        WHERE shift_date BETWEEN DATE(@start_date) AND DATE(@end_date)
+      ),
+      shift_with_flags AS (
+        SELECT
+          *,
+          -- Late if check-in time > scheduled start time (by more than 5 min grace)
+          CASE
+            WHEN check_in_timestamp IS NOT NULL
+              AND TIME(check_in_timestamp) > TIME_ADD(scheduled_start_time, INTERVAL 5 MINUTE)
+            THEN 1 ELSE 0
+          END AS is_late,
+          -- Early departure if check-out time < scheduled end time (by more than 5 min grace)
+          CASE
+            WHEN check_out_timestamp IS NOT NULL
+              AND TIME(check_out_timestamp) < TIME_SUB(scheduled_end_time, INTERVAL 5 MINUTE)
+            THEN 1 ELSE 0
+          END AS is_early_departure,
+          -- Overtime if actual hours > scheduled duration (by more than 15 min)
+          CASE
+            WHEN actual_hours IS NOT NULL
+              AND actual_hours > scheduled_duration_hours + 0.25
+            THEN 1 ELSE 0
+          END AS is_overtime
+        FROM shift_parsed
+      )
+      SELECT
+        employee_name,
+        COUNT(*) AS shifts_worked,
+        SUM(hours_worked) AS scheduled_hours,
+        ROUND(SUM(actual_hours), 2) AS actual_hours,
+        ROUND(SUM(hours_worked * hourly_wage_inr), 2) AS total_wages_inr,
+        ROUND(SAFE_DIVIDE(SUM(hours_worked), COUNT(*)), 2) AS average_hours_per_shift,
+        COUNTIF(check_in_timestamp IS NOT NULL) AS check_in_count,
+        SUM(is_late) AS late_check_in_count,
+        SUM(is_early_departure) AS early_departure_count,
+        SUM(is_overtime) AS overtime_shift_count
+      FROM shift_with_flags
+      GROUP BY employee_name
+      ORDER BY total_wages_inr DESC
+
+  # ---------------------------------------------------------------------------
+  # Milestone 10 - Customer Analytical Evidence
+  # ---------------------------------------------------------------------------
+
+  get_customer_behavior_profile:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Customer-level behavior profile over a date range. Joins
+      customer_bills to sales_transactions on bill_number. Returns
+      customer_id, customer_name, bill_count, total_spend,
+      average_bill_value, total_units, first_purchase_date,
+      last_purchase_date, active_purchase_days, purchase_frequency.
+      Only includes customers whose bills join to sales_transactions.
+      Pass start_date and end_date as YYYY-MM-DD.
+    parameters:
+      - name: start_date
+        type: string
+        description: Start of the date range, in YYYY-MM-DD format.
+      - name: end_date
+        type: string
+        description: End of the date range (inclusive), in YYYY-MM-DD format.
+    statement: |
+      WITH customer_sales AS (
+        SELECT
+          c.customer_id,
+          ANY_VALUE(c.customer_name) AS customer_name,
+          c.bill_number,
+          c.bill_date,
+          SUM(s.quantity) AS units,
+          SUM(s.total_price) AS spend
+        FROM `retail_lens_patchamomma.customer_bills` c
+        INNER JOIN `retail_lens_patchamomma.sales_transactions` s
+          ON s.bill_number = c.bill_number
+        WHERE c.bill_date BETWEEN DATE(@start_date) AND DATE(@end_date)
+        GROUP BY c.customer_id, c.bill_number, c.bill_date
+      ),
+      customer_agg AS (
+        SELECT
+          customer_id,
+          ANY_VALUE(customer_name) AS customer_name,
+          COUNT(DISTINCT bill_number) AS bill_count,
+          ROUND(SUM(spend), 2) AS total_spend,
+          ROUND(SAFE_DIVIDE(SUM(spend), COUNT(DISTINCT bill_number)), 2) AS average_bill_value,
+          SUM(units) AS total_units,
+          MIN(bill_date) AS first_purchase_date,
+          MAX(bill_date) AS last_purchase_date,
+          COUNT(DISTINCT bill_date) AS active_purchase_days
+        FROM customer_sales
+        GROUP BY customer_id
+      )
+      SELECT
+        customer_id,
+        customer_name,
+        bill_count,
+        total_spend,
+        average_bill_value,
+        total_units,
+        first_purchase_date,
+        last_purchase_date,
+        active_purchase_days,
+        ROUND(SAFE_DIVIDE(active_purchase_days, DATE_DIFF(DATE(@end_date), DATE(@start_date), DAY) + 1) * 100, 2) AS purchase_frequency_pct
+      FROM customer_agg
+      ORDER BY total_spend DESC
+
+  # ---------------------------------------------------------------------------
+  # Milestone 12 - Replenishment Risk Evidence
+  # ---------------------------------------------------------------------------
+
+  get_replenishment_risk:
+    kind: bigquery-sql
+    source: retail_lens
+    description: >
+      Replenishment risk evidence combining inventory_metadata,
+      inventory_stock, inventory_supply, and sales demand. Returns
+      product_id, product_name, category, essentiality_tier,
+      perishability_class, shelf_life_days, stock_on_hand, reorder_level,
+      incoming_quantity, expected_delivery_date, supplier_id,
+      supplier_lead_time_days, units_sold_in_period, average_daily_demand,
+      stock_coverage_days, days_until_expected_delivery. Does NOT make
+      reorder recommendations. Pass start_date and end_date as YYYY-MM-DD.
+    parameters:
+      - name: start_date
+        type: string
+        description: Start of the sales period for demand calculation, in YYYY-MM-DD format.
+      - name: end_date
+        type: string
+        description: End of the sales period (inclusive), in YYYY-MM-DD format.
+    statement: |
+      WITH demand AS (
+        SELECT
+          s.product_id,
+          SUM(s.quantity) AS units_sold_in_period
+        FROM `retail_lens_patchamomma.sales_transactions` s
+        WHERE DATE(s.time_stamp) BETWEEN DATE(@start_date) AND DATE(@end_date)
+        GROUP BY s.product_id
+      ),
+      period_days AS (
+        SELECT DATE_DIFF(DATE(@end_date), DATE(@start_date), DAY) + 1 AS days
+      )
+      SELECT
+        i.prod_id AS product_id,
+        i.prod_name AS product_name,
+        i.category,
+        i.essentiality_tier,
+        i.perishability_class,
+        i.shelf_life_days,
+        st.stock_on_hand,
+        st.reorder_level,
+        sup.incoming_quantity,
+        sup.expected_delivery_date,
+        sup.supplier_id,
+        sup.supplier_lead_time_days,
+        COALESCE(d.units_sold_in_period, 0) AS units_sold_in_period,
+        ROUND(SAFE_DIVIDE(COALESCE(d.units_sold_in_period, 0), (SELECT days FROM period_days)), 2) AS average_daily_demand,
+        CASE
+          WHEN COALESCE(d.units_sold_in_period, 0) > 0 AND st.stock_on_hand IS NOT NULL
+          THEN ROUND(st.stock_on_hand / SAFE_DIVIDE(d.units_sold_in_period, (SELECT days FROM period_days)), 1)
+          ELSE NULL
+        END AS stock_coverage_days,
+        CASE
+          WHEN sup.expected_delivery_date IS NOT NULL
+          THEN DATE_DIFF(sup.expected_delivery_date, DATE(@end_date), DAY)
+          ELSE NULL
+        END AS days_until_expected_delivery
+      FROM `retail_lens_patchamomma.inventory_metadata` i
+      LEFT JOIN `retail_lens_patchamomma.inventory_stock` st ON st.product_id = i.prod_id
+      LEFT JOIN `retail_lens_patchamomma.inventory_supply` sup ON sup.product_id = i.prod_id
+      LEFT JOIN demand d ON d.product_id = i.prod_id
+      ORDER BY
+        CASE WHEN st.stock_on_hand < st.reorder_level THEN 0 ELSE 1 END,
+        i.essentiality_tier DESC,
+        average_daily_demand DESC

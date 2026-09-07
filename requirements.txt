@@ -1,0 +1,11 @@
+# Retail Lens — Python dependencies
+#
+# Only packages strictly required for:
+#   Google ADK, Gemini API, MCP Toolbox, BigQuery, environment loading.
+
+google-adk>=1.0.0
+google-cloud-bigquery>=3.25.0
+python-dotenv>=1.0.0
+mcp>=1.24,<2
+fastapi>=0.100.0
+uvicorn>=0.20.0
