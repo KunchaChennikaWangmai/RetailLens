@@ -431,3 +431,22 @@ async def chat_endpoint(request: ChatRequest):
     print(f"[PERF] API response: {total_time:.3f}s total")
     
     return {"response": final_text}
+
+
+# ---------------------------------------------------------------------------
+# Frontend static serving (production container)
+#
+# The multi-stage Dockerfile builds frontend/dist with VITE_API_BASE_URL=/api
+# and copies it next to the app, so a single Cloud Run service serves both
+# the UI and the API from one origin (no CORS).  Mounted AFTER all /api
+# routes, so API paths always win.  The app uses hash-routing (#/home), so
+# serving index.html at "/" is sufficient — no SPA fallback needed.
+# Locally (no dist/ built) this block is skipped and dev stays on Vite:5173.
+# ---------------------------------------------------------------------------
+from pathlib import Path as _Path
+
+_FRONTEND_DIST = _Path(__file__).parents[1] / "frontend" / "dist"
+if _FRONTEND_DIST.is_dir():
+    from fastapi.staticfiles import StaticFiles
+
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")

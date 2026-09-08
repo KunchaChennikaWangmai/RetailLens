@@ -6,6 +6,8 @@ Inventory Agent, Workforce Agent, and Customer Agent based on
 the user's question.
 """
 
+import os
+
 from google.adk import Agent
 
 from app.agents.sales_agent import sales_agent
@@ -15,7 +17,7 @@ from app.agents.customer_agent import customer_agent
 
 root_agent = Agent(
     name="retail_lens_orchestrator",
-    model="gemini-3.6-flash",
+    model=os.getenv("RETAIL_LENS_MODEL", "gemini-3.6-flash"),
     description=(
         "Root orchestrator for Retail Lens. "
         "Coordinates the Sales Agent, Inventory Agent, Workforce Agent, "

@@ -6,6 +6,8 @@ app/prompts/customer_agent.txt and exposes the MCP Toolbox
 customer behavior tool.
 """
 
+import os
+
 from pathlib import Path
 
 from google.adk import Agent
@@ -16,7 +18,7 @@ _CUSTOMER_AGENT_INSTRUCTION = _PROMPT_PATH.read_text(encoding="utf-8")
 
 customer_agent = Agent(
     name="customer_agent",
-    model="gemini-3.6-flash",
+    model=os.getenv("RETAIL_LENS_MODEL", "gemini-3.6-flash"),
     description="Answers customer behavior, spending, and frequency queries using BigQuery data via MCP Toolbox.",
     instruction=_CUSTOMER_AGENT_INSTRUCTION,
     tools=[mcp_toolbox],
